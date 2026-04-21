@@ -676,12 +676,13 @@ def fetch_ads_txt(domain, is_app=False):
     return {"success": False, "content": None,
             "url": f"https://{domain}/ads.txt", "filename": "ads.txt"}
 
-def fetch_ads_txt_fast(domain, check_app=True, check_web=True):
+def fetch_ads_txt_fast(domain, check_app=True, check_web=True, req_timeout=4):
     """
     Fetch ads.txt and/or app-ads.txt based on flags.
     check_web=False  → skips ads.txt  (In-App / CTV only mode — faster)
     check_app=False  → skips app-ads.txt
     Both True        → fetches both and combines (default)
+    req_timeout      → per-request timeout in seconds (lower = faster for bulk runs)
     """
     domain    = extract_domain_from_field(domain)
     filenames = []
@@ -697,7 +698,7 @@ def fetch_ads_txt_fast(domain, check_app=True, check_web=True):
             for prefix in ["", "www."]:
                 url = f"{scheme}://{prefix}{domain}/{fname}"
                 try:
-                    r = requests.get(url, timeout=6, headers=HEADERS)
+                    r = requests.get(url, timeout=req_timeout, headers=HEADERS)
                     if r.status_code == 200 and r.text.strip():
                         combined_content.append(f"# --- {fname} ---")
                         combined_content.append(r.text.strip())
@@ -718,7 +719,7 @@ def fetch_ads_txt_fast(domain, check_app=True, check_web=True):
 
 # ─── PUBLISHER CHECK (PARALLEL) ───────────────────────────────────────────
 
-def check_single_publisher(seller, check_app, exchange_domain_filter="", check_web=True):
+def check_single_publisher(seller, check_app, exchange_domain_filter="", check_web=True, req_timeout=4):
     raw_domain = str(seller.get("domain", ""))
     domain     = extract_domain_from_field(raw_domain)
     seller_id  = str(seller.get("seller_id", "")).strip().lstrip("0") or str(seller.get("seller_id","")).strip()
@@ -735,7 +736,7 @@ def check_single_publisher(seller, check_app, exchange_domain_filter="", check_w
     if is_cdn_domain(domain):
         flags.append("🚨 CDN domain")
 
-    res = fetch_ads_txt_fast(domain, check_app=check_app, check_web=check_web)
+    res = fetch_ads_txt_fast(domain, check_app=check_app, check_web=check_web, req_timeout=req_timeout)
 
     if not res["success"]:
         return {"Publisher Name": name[:35], "Domain": domain,
@@ -1095,11 +1096,30 @@ def page_authenticator():
     else:
         st.info("🔎 **Full Check** — both ads.txt and app-ads.txt will be fetched and combined.")
 
-    col5, col6 = st.columns(2)
+    col5, col6, col7 = st.columns(3)
     with col5:
-        max_check = st.slider("Max publishers", 10, 500, 50)
+        max_check = st.slider(
+            "Max publishers", 10, 2000, 100,
+            help="Now supports up to 2000 publishers. For 1000+ entries, use 50 workers for best speed."
+        )
     with col6:
-        workers   = st.slider("Parallel workers", 5, 30, 20)
+        workers = st.slider(
+            "Parallel workers", 5, 80, 50,
+            help="Higher = faster. 50 works well for most. For 1000+ publishers use 60-80."
+        )
+    with col7:
+        timeout_override = st.slider(
+            "Request timeout (s)", 2, 10, 4,
+            help="Lower = skip slow domains faster. 4s is optimal for speed vs accuracy."
+        )
+
+    # Speed estimate
+    if max_check > 0 and workers > 0:
+        est_secs = max(5, int(max_check / workers) * timeout_override)
+        st.caption(
+            f"⚡ **Speed estimate:** ~{est_secs}–{est_secs*2}s for {max_check} publishers "
+            f"with {workers} workers. Second run: instant from cache."
+        )
 
     ex_domain_for_check = (exchange_domain_override.strip().lower().replace("www.", "")
                            if exchange_domain_override.strip()
@@ -1379,11 +1399,15 @@ def page_authenticator():
         prog     = st.progress(0)
         stat     = st.empty()
 
+        # Adaptive batch size — show live results every N completions
+        LIVE_UPDATE_EVERY = max(10, len(to_check) // 20)
+        live_table = st.empty()
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
             future_map = {
                 executor.submit(
                     check_single_publisher, s, check_app,
-                    ex_domain_for_check, check_web
+                    ex_domain_for_check, check_web, timeout_override
                 ): s
                 for s in to_check
             }
@@ -1392,7 +1416,27 @@ def page_authenticator():
                 results.append(result)
                 done += 1
                 prog.progress(done / len(to_check))
-                stat.text(f"✅ {done}/{len(to_check)} — {result.get('Domain','...')}")
+
+                legit_so_far  = len([r for r in results if "Legitimate" in r.get("Verdict","")])
+                fake_so_far   = len([r for r in results if "Fake"       in r.get("Verdict","")])
+                idmm_so_far   = len([r for r in results if "ID Mismatch"in r.get("Verdict","")])
+
+                stat.markdown(
+                    f"⚡ **{done}/{len(to_check)}** checked · "
+                    f"✅ {legit_so_far} Legit · "
+                    f"❌ {fake_so_far} Fake · "
+                    f"🟡 {idmm_so_far} ID Mismatch · "
+                    f"🏎️ {workers} workers @ {timeout_override}s timeout"
+                )
+
+                # Live preview table — updates every N rows
+                if done % LIVE_UPDATE_EVERY == 0 or done == len(to_check):
+                    preview_df = pd.DataFrame(results[-LIVE_UPDATE_EVERY:])
+                    if "Verdict" in preview_df.columns and "Domain" in preview_df.columns:
+                        live_table.dataframe(
+                            preview_df[["Publisher Name","Domain","Verdict"]].tail(10),
+                            use_container_width=True, height=220
+                        )
 
         prog.empty(); stat.empty()
         df = pd.DataFrame(results)
@@ -2102,22 +2146,25 @@ def page_intermediary_intel():
             st.warning("Paste at least one sellers.json URL")
             return
 
-        # Parse each line into (label, domain, url)
+        # Parse each line into (label, domain, full_url)
+        # IMPORTANT: preserve full URL including any path (e.g. aniview hash paths)
         sources = []
-        seen_domains = set()
+        seen_urls = set()
         for line in raw_lines[:20]:
             line = line.strip()
             if not line:
                 continue
             if line.startswith("http://") or line.startswith("https://"):
-                url    = line
-                domain = clean_domain(line)
+                full_url = line
+                # Use full URL as label key (not just domain) to allow same-domain different paths
+                label = line
             else:
-                domain = clean_domain(line)
-                url    = f"https://{domain}/sellers.json"
-            if domain not in seen_domains:
-                sources.append((domain, url))
-                seen_domains.add(domain)
+                domain   = clean_domain(line)
+                full_url = f"https://{domain}/sellers.json"
+                label    = full_url
+            if full_url not in seen_urls:
+                sources.append((label, full_url))
+                seen_urls.add(full_url)
 
         if len(raw_lines) > 20:
             st.warning(f"Max 20 URLs — using first 20 of {len(raw_lines)}")
@@ -2126,17 +2173,46 @@ def page_intermediary_intel():
 
         # ── Parallel fetch ────────────────────────────────────────────────
         def fetch_and_extract(args):
-            domain, url = args
-            sj = fetch_sellers_json(domain, use_cache=True)
-            if not sj["success"]:
-                return domain, [], False, "unreachable"
-            sellers = get_sellers(sj["data"])
+            label, full_url = args
+            # Use full URL directly — critical for non-standard paths like aniview hash URLs
+            cache_key = clean_domain(full_url)
+            cached    = cache_get_sellers(cache_key)
+            if cached.get("hit"):
+                data = cached["data"]
+                from_cache = True
+            else:
+                try:
+                    r = requests.get(full_url, timeout=15, headers=HEADERS)
+                    if r.status_code != 200:
+                        return label, [], False, f"HTTP {r.status_code}"
+                    data = None
+                    # Try all parse strategies
+                    for fn in [
+                        lambda: r.json(),
+                        lambda: json.loads(r.content.decode("utf-8-sig").strip()),
+                        lambda: json.loads(r.content.decode("utf-8", errors="ignore").strip()),
+                    ]:
+                        try:
+                            d = fn()
+                            if d and isinstance(d, dict) and "sellers" in d:
+                                data = d
+                                break
+                        except Exception:
+                            continue
+                    if data is None:
+                        return label, [], False, "invalid_json"
+                    cache_set_sellers(cache_key, full_url, data)
+                    from_cache = False
+                except Exception as e:
+                    return label, [], False, str(e)[:60]
+
+            sellers = get_sellers(data)
             intermediaries = [
                 s for s in sellers
                 if str(s.get("seller_type", "")).upper() == "INTERMEDIARY"
                 and (show_confidential or not s.get("is_confidential"))
             ]
-            return domain, intermediaries, sj.get("from_cache", False), "ok"
+            return label, intermediaries, from_cache, "ok"
 
         results_by_domain = {}
         errors = []
@@ -2147,19 +2223,20 @@ def page_intermediary_intel():
         with ThreadPoolExecutor(max_workers=len(sources)) as executor:
             future_map = {executor.submit(fetch_and_extract, src): src for src in sources}
             for future in as_completed(future_map):
-                domain, intermediaries, from_cache, status = future.result()
+                domain_key, intermediaries, from_cache, status = future.result()
                 done += 1
                 prog.progress(done / len(sources))
                 if status == "ok":
-                    results_by_domain[domain] = {
+                    results_by_domain[domain_key] = {
                         "intermediaries": intermediaries,
                         "from_cache":     from_cache,
                         "count":          len(intermediaries)
                     }
-                    stat.text(f"✅ {done}/{len(sources)} — {domain}: {len(intermediaries)} intermediaries {'⚡cache' if from_cache else '🌐live'}")
+                    label_short = domain_key[:50]
+                    stat.text(f"✅ {done}/{len(sources)} — {label_short}: {len(intermediaries)} intermediaries {'⚡cache' if from_cache else '🌐live'}")
                 else:
-                    errors.append(domain)
-                    stat.text(f"❌ {done}/{len(sources)} — {domain}: unreachable")
+                    errors.append(domain_key)
+                    stat.text(f"❌ {done}/{len(sources)} — {domain_key[:50]}: {status}")
 
         prog.empty(); stat.empty()
 
@@ -2279,20 +2356,25 @@ def page_intermediary_intel():
 
         # Post-results filter
         max_appearances = int(df["Appearances"].max()) if len(df) > 0 else 1
+
+        # Only show slider if there's a meaningful range to filter (max > 1)
+        filter_min = 1
         filter_col1, filter_col2 = st.columns(2)
         with filter_col1:
-            filter_min = st.slider(
-                "Filter: Min appearances",
-                min_value=1,
-                max_value=max(max_appearances, 1),
-                value=1,
-                key="post_filter_min",
-                help=f"You have {len(sources)} files. Set to {len(sources)} to see intermediaries common to ALL files."
-            )
+            if max_appearances > 1:
+                filter_min = st.slider(
+                    "Filter: Min appearances",
+                    min_value=1,
+                    max_value=max_appearances,
+                    value=1,
+                    key="post_filter_min",
+                    help=f"You have {len(sources)} files checked. Set to {len(sources)} to see intermediaries common to ALL files."
+                )
+            else:
+                st.info(f"Only 1 file loaded successfully — showing all {len(df)} unique intermediaries.")
         with filter_col2:
-            st.metric("Showing after filter",
-                      len(df[df["Appearances"] >= filter_min]),
-                      delta=f"of {len(df)} unique")
+            showing = len(df[df["Appearances"] >= filter_min])
+            st.metric("Showing", showing, delta=f"of {len(df)} unique")
 
         df = df[df["Appearances"] >= filter_min].reset_index(drop=True)
 
@@ -3766,7 +3848,45 @@ def page_digest():
 
 # ─── MAIN ─────────────────────────────────────────────────────────────────
 
+def check_password():
+    """Simple password gate — blocks access without correct password."""
+    # Try secrets first, fall back to hardcoded password
+    try:
+        correct_password = st.secrets["APP_PASSWORD"]
+    except Exception:
+        correct_password = "Advlion@2024"   # fallback
+
+    def password_entered():
+        if st.session_state["password"] == correct_password:
+            st.session_state["authenticated"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["authenticated"] = False
+
+    if st.session_state.get("authenticated"):
+        return True
+
+    st.markdown("""
+    <div style='text-align:center; padding: 80px 0 20px 0;'>
+        <div style='font-size:52px;'>🔗</div>
+        <div style='font-size:24px; font-weight:800; color:#7EC8E3;'>AdChain Inspector</div>
+        <div style='font-size:13px; color:#5577AA; margin:4px 0 30px 0;'>Advlion Supply Chain Intelligence · Private Access</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    col1, col2, col3 = st.columns([1,2,1])
+    with col2:
+        st.text_input("Access Password", type="password",
+                      key="password", on_change=password_entered,
+                      placeholder="Enter password to continue...")
+        if "authenticated" in st.session_state and not st.session_state["authenticated"]:
+            st.error("❌ Incorrect password")
+    return False
+
+
 def main():
+    if not check_password():
+        return
     init_db()
     page = sidebar()
     page_map = {
