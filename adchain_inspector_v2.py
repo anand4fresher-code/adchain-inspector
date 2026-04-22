@@ -1938,7 +1938,10 @@ def page_demand():
 
     col1, col2 = st.columns([3,1])
     with col1: demand_domain = st.text_input("Demand Partner Domain", placeholder="e.g. anzu.io")
-    with col2: also_name = st.checkbox("Also search by name", value=True)
+    with col2: also_name = st.checkbox("Also search by name ⚠️", value=False,
+                help="OFF by default — domain matching is the only reliable signal. "
+                     "Name can be set to anything by the publisher. "
+                     "Enable only to flag entries where name matches but domain differs.")
 
     with st.expander("⚙️ Edit Exchange List (22 SSPs)"):
         st.caption("Core Web/Display · Mobile/In-App · Native")
@@ -1965,23 +1968,33 @@ def page_demand():
     if st.button("🔍 Check All Exchanges", type="primary"):
         if not demand_domain.strip(): st.warning("Enter domain"); return
         dd        = clean_domain(demand_domain)
-        name_part = dd.split(".")[0].lower()
+        name_part = dd.split(".")[0].lower()   # e.g. "memob" from "memob.com"
 
         # ── Parallel fetch function — one per exchange ─────────────────
         def check_one_exchange(args):
+            import re as _re
             ex_nm, ex_dm = args
-            # fetch_sellers_json uses SQLite cache — instant on repeat runs
             sj = fetch_sellers_json(ex_dm, use_cache=True)
             if not sj["success"]:
-                return ex_nm, None, []
+                return ex_nm, None, [], []
             sellers = get_sellers(sj["data"])
+
+            # PRIMARY: exact domain match — only reliable signal
             matches = [s for s in sellers
                        if str(s.get("domain","")).lower().replace("www.","") == dd]
+
+            # SECONDARY: name-only matches (different domain) — flagged separately
+            # Only runs when "Also search by name" is enabled
+            name_only = []
             if also_name and not matches:
-                matches = [s for s in sellers
-                           if name_part in str(s.get("name","")).lower()
-                           or name_part in str(s.get("domain","")).lower()]
-            return ex_nm, matches, sj.get("from_cache", False)
+                pattern = r'(?<![a-z0-9])' + _re.escape(name_part) + r'(?![a-z0-9])'
+                for s in sellers:
+                    s_dom  = str(s.get("domain","")).lower().replace("www.","").strip()
+                    s_name = str(s.get("name","")).lower().strip()
+                    if s_dom != dd and _re.search(pattern, s_name):
+                        name_only.append(s)
+
+            return ex_nm, matches, sj.get("from_cache", False), name_only
 
         results   = []
         all_seats = []
@@ -2005,7 +2018,7 @@ def page_demand():
                 prog.progress(done / len(exchanges))
 
                 try:
-                    ex_nm_r, matches, from_cache = future.result()
+                    ex_nm_r, matches, from_cache, name_only = future.result()
                     if from_cache:
                         cached_count += 1
 
@@ -2016,9 +2029,11 @@ def page_demand():
                             "Seats":         "—",
                             "Seller Type(s)":"—",
                             "Seller IDs":    "—",
+                            "Match Type":    "—",
                             "Source":        "—"
                         })
                     elif matches:
+                        # ✅ Real domain match
                         types = list(set([str(m.get("seller_type","—")).upper() for m in matches]))
                         sids  = [str(m.get("seller_id","")) for m in matches]
                         results.append({
@@ -2027,6 +2042,7 @@ def page_demand():
                             "Seats":         len(matches),
                             "Seller Type(s)":", ".join(types),
                             "Seller IDs":    ", ".join(sids[:5]) + ("…" if len(sids) > 5 else ""),
+                            "Match Type":    "✅ Domain match",
                             "Source":        "⚡ Cache" if from_cache else "🌐 Live"
                         })
                         for m in matches:
@@ -2037,6 +2053,19 @@ def page_demand():
                                 "Domain":      m.get("domain"),
                                 "Seller Type": m.get("seller_type")
                             })
+                    elif name_only:
+                        # ⚠️ Name matched but domain is different — flag only, not a real seat
+                        wrong_doms = list(set([str(m.get("domain","—")) for m in name_only]))
+                        sids = [str(m.get("seller_id","")) for m in name_only]
+                        results.append({
+                            "Exchange":      ex_nm,
+                            "Status":        "⚠️ Name Only",
+                            "Seats":         0,
+                            "Seller Type(s)":"—",
+                            "Seller IDs":    ", ".join(sids[:3]),
+                            "Match Type":    f"⚠️ Name match, domain={', '.join(wrong_doms[:2])}",
+                            "Source":        "⚡ Cache" if from_cache else "🌐 Live"
+                        })
                     else:
                         results.append({
                             "Exchange":      ex_nm,
@@ -2044,6 +2073,7 @@ def page_demand():
                             "Seats":         0,
                             "Seller Type(s)":"—",
                             "Seller IDs":    "—",
+                            "Match Type":    "—",
                             "Source":        "⚡ Cache" if from_cache else "🌐 Live"
                         })
                     stat.text(
@@ -2057,6 +2087,7 @@ def page_demand():
                         "Seats":         "—",
                         "Seller Type(s)":"—",
                         "Seller IDs":    str(e)[:60],
+                        "Match Type":    "—",
                         "Source":        "—"
                     })
 
